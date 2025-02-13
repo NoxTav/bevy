@@ -8,6 +8,7 @@ use super::{
     MeshVertexBufferLayouts, MeshWindingInvertError, VertexAttributeValues, VertexBufferLayout,
 };
 use alloc::collections::BTreeMap;
+use std::iter;
 use bevy_asset::{Asset, Handle, RenderAssetUsages};
 use bevy_image::Image;
 use bevy_math::{primitives::Triangle3d, *};
@@ -113,13 +114,47 @@ pub struct Mesh {
     /// Uses a [`BTreeMap`] because, unlike `HashMap`, it has a defined iteration order,
     /// which allows easy stable `VertexBuffers` (i.e. same buffer order)
     #[reflect(ignore)]
-    attributes: BTreeMap<MeshVertexAttributeId, MeshAttributeData>,
+    attributes: MeshAttributes,
     indices: Option<Indices>,
     morph_targets: Option<Handle<Image>>,
     morph_target_names: Option<Vec<String>>,
     pub asset_usage: RenderAssetUsages,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MeshPackedData {
+    data: Vec<u8>,
+    attributes: Vec<MeshVertexAttribute>
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum MeshAttributes {
+    Tree(BTreeMap<MeshVertexAttributeId, MeshAttributeData>),
+    PackedData(MeshPackedData)
+}
+
+impl Default for MeshAttributes {
+    fn default() -> Self {
+        Self::Tree(BTreeMap::new())
+    }
+}
+
+// Define an iterator type that wraps both cases
+enum MeshAttributesIter<'a> {
+    Tree(iter::Map<std::collections::btree_map::Iter<'a, MeshVertexAttributeId, MeshAttributeData>, fn((&'a MeshVertexAttributeId, &'a MeshAttributeData)) -> &'a MeshVertexAttribute>),
+    Packed(std::slice::Iter<'a, MeshVertexAttribute>),
+}
+
+impl<'a> Iterator for MeshAttributesIter<'a> {
+    type Item = &'a MeshVertexAttribute;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            MeshAttributesIter::Tree(iter) => iter.next(),
+            MeshAttributesIter::Packed(iter) => iter.next(),
+        }
+    }
+}
 impl Mesh {
     /// Where the vertex is located in space. Use in conjunction with [`Mesh::insert_attribute`]
     /// or [`Mesh::with_inserted_attribute`].
@@ -210,6 +245,184 @@ impl Mesh {
         self.primitive_topology
     }
 
+    fn iter_attributes(&self) -> MeshAttributesIter {
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {
+                MeshAttributesIter::Tree(tree.iter().map(|(_, data)| &data.attribute))
+            }
+            MeshAttributes::PackedData(packed) => {
+                MeshAttributesIter::Packed(packed.attributes.iter())
+            }
+        }
+    }
+
+    pub fn pack_attributes(&mut self) {
+        let MeshAttributes::Tree(tree) = &self.attributes else {
+            return;
+        };
+
+        if tree.is_empty() {
+            self.attributes = MeshAttributes::PackedData(MeshPackedData {
+                attributes: Vec::new(),
+                data: Vec::new(),
+            });
+            return;
+        }
+
+        let attributes: Vec<MeshVertexAttribute> = tree.values().map(|a| a.attribute.clone()).collect();
+        let packed_data = self.create_packed_vertex_buffer_data();
+        self.attributes = MeshAttributes::PackedData(MeshPackedData {
+            attributes,
+            data: packed_data,
+        });
+    }
+    pub fn set_packed_attributes(&mut self, data: &[u8], attributes: Vec<MeshVertexAttribute>) {
+        self.attributes = MeshAttributes::PackedData(MeshPackedData { data: data.into(), attributes });
+        self.sort_packed_attributes_by_id();
+    }
+    pub fn with_packed_attributes(mut self, data: &[u8], attributes: Vec<MeshVertexAttribute>) -> Self {
+        self.set_packed_attributes(data, attributes);
+        self
+    }
+    fn insert_packed_attribute(&mut self, data: &[u8], attribute: MeshVertexAttribute) {
+        let vertex_size = self.get_vertex_size() as usize;
+        let vertex_count = self.count_vertices();
+
+        let (packed_data, mut packed_attributes) = match &self.attributes {
+            MeshAttributes::Tree(tree) => {
+                if tree.is_empty() {
+                    self.set_packed_attributes(data, vec![attribute]);
+                    return;
+                }
+                (
+                    self.create_packed_vertex_buffer_data(),
+                    tree.values().map(|a| a.attribute).collect(),
+                )
+            }
+            MeshAttributes::PackedData(data) => (data.data.to_owned(), data.attributes.to_owned()),
+        };
+
+        // Determine the correct insertion index in sorted order
+        let insert_index = packed_attributes
+            .binary_search_by_key(&attribute.id, |attr| attr.id)
+            .unwrap_or_else(|i| i);
+        packed_attributes.insert(insert_index, attribute.clone());
+
+        let new_packed_vertex_size = vertex_size + attribute.format.size() as usize;
+        let new_vertex_size = attribute.format.size() as usize;
+        // Set vertex count as in `count_vertices`
+        let new_vertex_count = core::cmp::min(vertex_count, data.len() / new_vertex_size);
+
+        let mut result_data = Vec::with_capacity(new_packed_vertex_size * new_vertex_count);
+
+        for (new_attribute_bytes, packed_data_bytes) in data
+            .chunks_exact(new_vertex_size)
+            .take(new_vertex_count)
+            .zip(packed_data.chunks_exact(vertex_size).take(new_vertex_count))
+        {
+            let mut sorted_vertex = Vec::with_capacity(new_packed_vertex_size);
+            let mut old_offset = 0;
+
+            for i in 0..packed_attributes.len() {
+                if i == insert_index {
+                    sorted_vertex.extend_from_slice(new_attribute_bytes);
+                }
+
+                if let Some(original_attr) = packed_attributes.get(i.saturating_sub(1)) {
+                    let attr_size = original_attr.format.size() as usize;
+                    sorted_vertex.extend_from_slice(&packed_data_bytes[old_offset..old_offset + attr_size]);
+                    old_offset += attr_size;
+                }
+            }
+
+            result_data.extend_from_slice(&sorted_vertex);
+        }
+
+        self.attributes = MeshAttributes::PackedData(MeshPackedData {
+            attributes: packed_attributes,
+            data: result_data,
+        });
+    }
+
+    fn sort_packed_attributes_by_id(&mut self) {
+        let vertex_size = self.get_vertex_size() as usize;
+        let vertex_count = self.count_vertices();
+
+        let MeshAttributes::PackedData(data) = &mut self.attributes else {
+            return;
+        };
+
+        let original_attributes = data.attributes.clone();
+        data.attributes.sort_by_key(|attr| attr.id);
+        let mut sorted_data = vec![0u8; data.data.len()];
+
+        for (vertex_index, packed_vertex) in data.data.chunks_exact(vertex_size).take(vertex_count).enumerate() {
+            let sorted_offset = vertex_index * vertex_size;
+
+            for attr in &data.attributes {
+                let original_index = original_attributes.iter().position(|a| a.id == attr.id).unwrap();
+                let attr_offset: usize = original_attributes
+                    .iter()
+                    .take(original_index)
+                    .map(|a| a.format.size() as usize)
+                    .sum();
+
+                let attr_size = attr.format.size() as usize;
+                let target_offset = sorted_offset + attr_offset;
+                sorted_data[target_offset..target_offset + attr_size]
+                    .copy_from_slice(&packed_vertex[attr_offset..attr_offset + attr_size]);
+            }
+        }
+        data.data = sorted_data;
+    }
+
+
+    fn remove_packed_attribute(&mut self, attribute_id: MeshVertexAttributeId) {
+        let vertex_size = self.get_vertex_size() as usize;
+        let vertex_count = self.count_vertices();
+
+        let (packed_data, mut packed_attributes) = match &mut self.attributes {
+            MeshAttributes::Tree(_) => {
+                return;
+            }
+            MeshAttributes::PackedData(data) => (data.data.clone(), data.attributes.clone()),
+        };
+
+        let Some(index) = packed_attributes.iter().position(|attr| attr.id == attribute_id) else {
+            return;
+        };
+
+        let removed_attribute_size = packed_attributes[index].format.size() as usize;
+        packed_attributes.remove(index);
+
+        let new_packed_vertex_size = vertex_size - removed_attribute_size;
+        let new_vertex_count = core::cmp::min(vertex_count, packed_data.len() / vertex_size);
+
+        let mut result_data = Vec::with_capacity(new_packed_vertex_size * new_vertex_count);
+
+        for packed_data_bytes in packed_data.chunks_exact(vertex_size).take(new_vertex_count) {
+            let mut new_vertex = Vec::with_capacity(new_packed_vertex_size);
+
+            let mut offset = 0;
+            for attr in &packed_attributes {
+                let attr_size = attr.format.size() as usize;
+
+                // Copy only attributes that are NOT the one being removed
+                new_vertex.extend_from_slice(&packed_data_bytes[offset..offset + attr_size]);
+
+                offset += attr_size;
+            }
+
+            result_data.extend_from_slice(&new_vertex);
+        }
+
+        // Update attributes with the modified list
+        self.attributes = MeshAttributes::PackedData(MeshPackedData {
+            attributes: packed_attributes,
+            data: result_data,
+        });
+    }
+
     /// Sets the data for a vertex attribute (position, normal, etc.). The name will
     /// often be one of the associated constants such as [`Mesh::ATTRIBUTE_POSITION`].
     ///
@@ -232,8 +445,10 @@ impl Mesh {
             );
         }
 
-        self.attributes
-            .insert(attribute.id, MeshAttributeData { attribute, values });
+        match &mut self.attributes {
+            MeshAttributes::Tree(tree) => { tree.insert(attribute.id, MeshAttributeData { attribute, values }); }
+            MeshAttributes::PackedData(_) => {self.insert_packed_attribute(values.get_bytes(), attribute)}
+        };
     }
 
     /// Consumes the mesh and returns a mesh with data set for a vertex attribute (position, normal, etc.).
@@ -261,9 +476,10 @@ impl Mesh {
         &mut self,
         attribute: impl Into<MeshVertexAttributeId>,
     ) -> Option<VertexAttributeValues> {
-        self.attributes
-            .remove(&attribute.into())
-            .map(|data| data.values)
+        match &mut self.attributes {
+            MeshAttributes::Tree(tree) => {tree.remove(&attribute.into()).map(|data| data.values)}
+            MeshAttributes::PackedData(_) => {self.remove_packed_attribute(attribute.into()); None}
+        }
     }
 
     /// Consumes the mesh and returns a mesh without the data for a vertex attribute
@@ -277,7 +493,10 @@ impl Mesh {
 
     #[inline]
     pub fn contains_attribute(&self, id: impl Into<MeshVertexAttributeId>) -> bool {
-        self.attributes.contains_key(&id.into())
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {tree.contains_key(&id.into())}
+            MeshAttributes::PackedData(data) => {let id = id.into(); data.attributes.iter().find(|a| a.id == id).is_some()}
+        }
     }
 
     /// Retrieves the data currently set to the vertex attribute with the specified [`MeshVertexAttributeId`].
@@ -286,7 +505,10 @@ impl Mesh {
         &self,
         id: impl Into<MeshVertexAttributeId>,
     ) -> Option<&VertexAttributeValues> {
-        self.attributes.get(&id.into()).map(|data| &data.values)
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {tree.get(&id.into()).map(|data| &data.values)}
+            MeshAttributes::PackedData(data) => unimplemented!()
+        }
     }
 
     /// Retrieves the full data currently set to the vertex attribute with the specified [`MeshVertexAttributeId`].
@@ -295,7 +517,10 @@ impl Mesh {
         &self,
         id: impl Into<MeshVertexAttributeId>,
     ) -> Option<&MeshAttributeData> {
-        self.attributes.get(&id.into())
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {tree.get(&id.into())}
+            MeshAttributes::PackedData(data) => unimplemented!()
+        }
     }
 
     /// Retrieves the data currently set to the vertex attribute with the specified `name` mutably.
@@ -304,27 +529,32 @@ impl Mesh {
         &mut self,
         id: impl Into<MeshVertexAttributeId>,
     ) -> Option<&mut VertexAttributeValues> {
-        self.attributes
-            .get_mut(&id.into())
-            .map(|data| &mut data.values)
+        match &mut self.attributes {
+            MeshAttributes::Tree(tree) => {tree.get_mut(&id.into()).map(|data| &mut data.values)}
+            MeshAttributes::PackedData(data) => unimplemented!()
+        }
     }
 
     /// Returns an iterator that yields references to the data of each vertex attribute.
     pub fn attributes(
         &self,
     ) -> impl Iterator<Item = (&MeshVertexAttribute, &VertexAttributeValues)> {
-        self.attributes
-            .values()
-            .map(|data| (&data.attribute, &data.values))
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {tree.values()
+            .map(|data| (&data.attribute, &data.values))}
+            MeshAttributes::PackedData(data) => unimplemented!()
+        }
     }
 
     /// Returns an iterator that yields mutable references to the data of each vertex attribute.
     pub fn attributes_mut(
         &mut self,
     ) -> impl Iterator<Item = (&MeshVertexAttribute, &mut VertexAttributeValues)> {
-        self.attributes
-            .values_mut()
-            .map(|data| (&data.attribute, &mut data.values))
+        match &mut self.attributes {
+            MeshAttributes::Tree(tree) => {tree.values_mut()
+            .map(|data| (&data.attribute, &mut data.values))}
+            MeshAttributes::PackedData(data) => unimplemented!()
+        }
     }
 
     /// Sets the vertex indices of the mesh. They describe how triangles are constructed out of the
@@ -376,10 +606,10 @@ impl Mesh {
 
     /// Returns the size of a vertex in bytes.
     pub fn get_vertex_size(&self) -> u64 {
-        self.attributes
-            .values()
-            .map(|data| data.attribute.format.size())
-            .sum()
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {tree.values().map(|data| data.attribute.format.size()).sum()}
+            MeshAttributes::PackedData(data) => data.attributes.iter().map(|attribute| attribute.format.get_size()).sum(),
+        }
     }
 
     /// Returns the size required for the vertex buffer in bytes.
@@ -403,18 +633,22 @@ impl Mesh {
         &self,
         mesh_vertex_buffer_layouts: &mut MeshVertexBufferLayouts,
     ) -> MeshVertexBufferLayoutRef {
-        let mut attributes = Vec::with_capacity(self.attributes.len());
-        let mut attribute_ids = Vec::with_capacity(self.attributes.len());
+        let attribute_data = self.iter_attributes();
+        let attributes_len  = self.iter_attributes().count();
+        let mut attributes = Vec::with_capacity(attributes_len);
+        let mut attribute_ids = Vec::with_capacity(attributes_len);
         let mut accumulated_offset = 0;
-        for (index, data) in self.attributes.values().enumerate() {
-            attribute_ids.push(data.attribute.id);
-            attributes.push(VertexAttribute {
-                offset: accumulated_offset,
-                format: data.attribute.format,
-                shader_location: index as u32,
-            });
-            accumulated_offset += data.attribute.format.size();
+
+        for (index, data) in attribute_data.enumerate() {
+           attribute_ids.push(data.id);
+           attributes.push(VertexAttribute {
+               offset: accumulated_offset,
+               format: data.format,
+               shader_location: index as u32,
+           });
+           accumulated_offset += data.format.size();
         }
+
 
         let layout = MeshVertexBufferLayout {
             layout: VertexBufferLayout {
@@ -431,27 +665,32 @@ impl Mesh {
     ///
     /// If the attributes have different vertex counts, the smallest is returned.
     pub fn count_vertices(&self) -> usize {
-        let mut vertex_count: Option<usize> = None;
-        for (attribute_id, attribute_data) in &self.attributes {
-            let attribute_len = attribute_data.values.len();
-            if let Some(previous_vertex_count) = vertex_count {
-                if previous_vertex_count != attribute_len {
-                    let name = self
-                        .attributes
-                        .get(attribute_id)
-                        .map(|data| data.attribute.name.to_string())
-                        .unwrap_or_else(|| format!("{attribute_id:?}"));
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {let mut vertex_count: Option<usize> = None;
+                for (attribute_id, attribute_data) in tree {
+                    let attribute_len = attribute_data.values.len();
+                    if let Some(previous_vertex_count) = vertex_count {
+                        if previous_vertex_count != attribute_len {
+                            let name = tree
+                                .get(attribute_id)
+                                .map(|data| data.attribute.name.to_string())
+                                .unwrap_or_else(|| format!("{attribute_id:?}"));
 
-                    warn!("{name} has a different vertex count ({attribute_len}) than other attributes ({previous_vertex_count}) in this mesh, \
+                            warn!("{name} has a different vertex count ({attribute_len}) than other attributes ({previous_vertex_count}) in this mesh, \
                         all attributes will be truncated to match the smallest.");
-                    vertex_count = Some(core::cmp::min(previous_vertex_count, attribute_len));
+                            vertex_count = Some(core::cmp::min(previous_vertex_count, attribute_len));
+                        }
+                    } else {
+                        vertex_count = Some(attribute_len);
+                    }
                 }
-            } else {
-                vertex_count = Some(attribute_len);
+
+                vertex_count.unwrap_or(0)}
+            MeshAttributes::PackedData(packed_data) => {
+                packed_data.data.len() / self.count_vertices()
             }
         }
 
-        vertex_count.unwrap_or(0)
     }
 
     /// Computes and returns the vertex data of the mesh as bytes.
@@ -476,24 +715,35 @@ impl Mesh {
     /// If the vertex attributes have different lengths, they are all truncated to
     /// the length of the smallest.
     pub fn write_packed_vertex_buffer_data(&self, slice: &mut [u8]) {
-        let vertex_size = self.get_vertex_size() as usize;
-        let vertex_count = self.count_vertices();
-        // bundle into interleaved buffers
-        let mut attribute_offset = 0;
-        for attribute_data in self.attributes.values() {
-            let attribute_size = attribute_data.attribute.format.size() as usize;
-            let attributes_bytes = attribute_data.values.get_bytes();
-            for (vertex_index, attribute_bytes) in attributes_bytes
-                .chunks_exact(attribute_size)
-                .take(vertex_count)
-                .enumerate()
-            {
-                let offset = vertex_index * vertex_size + attribute_offset;
-                slice[offset..offset + attribute_size].copy_from_slice(attribute_bytes);
-            }
+        match &self.attributes {
+            MeshAttributes::Tree(tree) => {
+                let vertex_size = self.get_vertex_size() as usize;
+                let vertex_count = self.count_vertices();
+                // bundle into interleaved buffers
+                let mut attribute_offset = 0;
+                for attribute_data in tree.values() {
+                    let attribute_size = attribute_data.attribute.format.size() as usize;
+                    let attributes_bytes = attribute_data.values.get_bytes();
+                    for (vertex_index, attribute_bytes) in attributes_bytes
+                        .chunks_exact(attribute_size)
+                        .take(vertex_count)
+                        .enumerate()
+                    {
+                        let offset = vertex_index * vertex_size + attribute_offset;
+                        slice[offset..offset + attribute_size].copy_from_slice(attribute_bytes);
+                    }
 
-            attribute_offset += attribute_size;
+                    attribute_offset += attribute_size;
+                }
+            }
+            MeshAttributes::PackedData(data) => {
+                if data.data.len() != slice.len() {
+                    return; // What to do ???
+                }
+                slice.copy_from_slice(&data.data);
+            }
         }
+
     }
 
     /// Duplicates the vertex attributes so that no vertices are shared.
@@ -509,7 +759,11 @@ impl Mesh {
             return;
         };
 
-        for attributes in self.attributes.values_mut() {
+        let MeshAttributes::Tree(tree) = &mut self.attributes else {
+            return;
+        };
+
+        for attributes in tree.values_mut() {
             let indices = indices.iter();
             #[expect(
                 clippy::match_same_arms,
